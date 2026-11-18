@@ -22,6 +22,8 @@ user-facing summary; this file is the reasoning.
 | RhinoCommon / Grasshopper SDK | McNeel | MIT (RhinoCommon) / developer terms; referenced not shipped | **no** |
 | Newtonsoft.Json, Roslyn, System.* DLLs | NuGet | MIT | yes — inside Yak package only, with notices |
 | IKEA product names in manifests | public catalogue facts | nominative fair use; disclaimer in notices | yes (names only) |
+| OpenSeesPy (benchmark reference solver, `benchmarks/`) | Univ. of California / Oregon State, PyPI `openseespy` | free for research, education and internal use; commercial redistribution of anything that imports it needs a licence (Dr. Minjie Zhu) | **no** — optional `bench` dependency group only; never imported by `almond_mcp`; `benchmarks/` is outside the wheel and sdist |
+| Generated asset library (`GeneratedAssetfiles/models/*.glb` + `.almond.json` contracts) | generated with Meshy from self-authored prompts (`GeneratedAssetfiles/catalogue.json`), normalised by `tools/build_generated_assets.py` | Meshy Terms: output generated on a paid plan belongs to the account; released here under CC BY 4.0 (manifest/contracts MIT) | yes — git repository; manifest in the wheel, model files fetched by `almond-mcp fetch-assets` |
 
 ## 3D Warehouse analysis
 
@@ -50,6 +52,27 @@ as non-redistributable and `fetch-assets` reports them as
 "no recorded source URL". TODO: replace with original SVGs, then move them
 into the distributable set.
 
+## Generated (Meshy) asset library
+
+`GeneratedAssetfiles/` is the one library whose model files *are*
+distributed. Every asset was produced from a self-authored prompt through
+Meshy's image and image-to-3D pipelines on a paid plan; Meshy's terms grant
+paid accounts ownership of generated output, so the files are ours to
+license. They are released under CC BY 4.0 (attribution: "Almond generated
+asset library"), and the manifest, contracts and build tooling are MIT like
+the rest of the repository. Provenance is recorded per asset in the manifest
+(`geometry_source.parameters`: prompt, image task id, mesh task id, model,
+date) and in `GeneratedAssetfiles/provenance.json`.
+
+Starting with 0.6.0rc1, the wheel includes the generated GLBs, MIT contracts,
+catalogue/provenance, passport schema and preview renders for offline use.
+The release verifier checks an explicit allowlist: no 3D Warehouse models,
+raw Meshy downloads, compiled bridge binaries or example projects. Earlier
+versions used repository download URLs. 3D Warehouse content stays manual.
+
+Raw Meshy downloads (`GeneratedAssetfiles/raw/`) are gitignored; the tracked
+normalised files are derived from them deterministically.
+
 ## Capsules vs. example files
 
 A capsule manifest declares an input/output contract (reserved
@@ -60,6 +83,44 @@ supplied by the user (or authored per `capsules/AUTHORING.md`), so shipping
 the manifests is analogous to wasp-mcp shipping factual pattern knowledge
 derived from examples without shipping the examples.
 
+## Commercial distribution: environment engine, constructions, code packs, panel (2026-11-03)
+
+Goal: the Python package and the Rhino plugin can be sold without third-party IP problems.
+
+| Content | Origin | Licence position | Distributed? |
+| --- | --- | --- | --- |
+| Environment engine (`almond_mcp/environment/*.py`), panel workspace (`library_ui/environment.*`, `EnvironmentWorkspace.cs`) | self-authored; methods implemented from cited papers and standards (no code from Ladybug/Honeybee, Radiance, EnergyPlus, ClimateStudio) | MIT | yes |
+| Material λ/ρ/c, glass optics | EnergyPlus v26.2.0 `datasets/` (ASHRAE HOF, WINDOW glass library) | EnergyPlus licence, BSD-style: redistribution permitted with the notice; the name EnergyPlus may not be used for the product | yes, with `LICENSES/EnergyPlus.txt` and the notice |
+| Generic reflectances | honeybee-standards v2.0.7 | MIT | yes, with notice |
+| DE age-band U-values | BAnz AT 04.12.2020 B1 | official work, Section 5 UrhG (no copyright) | yes, cited |
+| EU stock U-values | Hotmaps building-stock (TABULA-based) | CC BY 4.0 | yes, attributed |
+| England AD L limits / notional fabric | Approved Document L 2021 (2023 amendments) | OGL v3.0 (licence statement in the document) | yes, attributed |
+| Singapore ETTV/RETV/RTTV | BCA Code on Envelope Thermal Performance | BCA terms: no reproduction without written permission; formulas are a method | method only - CF and SC computed by Almond; users may load their own licensed tables at run time (never bundled) |
+| Assembly build-ups, finishes, frames, room-use profiles | self-authored assumptions | MIT | yes, labelled `almond-own` |
+| Aalborg 2021 materials table | Johra, DCE Technical Report 289 | CC BY-SA 4.0 (ShareAlike would bind merged data) | **no** - not bundled; a user-side import (never merged) is a possible follow-up |
+| honeybee-energy-standards, IGDB, bauteilkatalog.ch, SS / EN / ISO / Eurocode tables | various | AGPL / CC BY-ND / proprietary / paid standards | **no** |
+
+Enforcement: `tests/test_rooms_constructions.py::test_library_provenance_and_licences` fails when a bundled
+value lacks a source or a source's licence is not on the allow-list; `tools/license_scan.py` checks the
+Python dependency closure, the plugin's NuGet packages, vendored UI files and the data sources, and
+`tools/verify_release.py` refuses a wheel when it reports anything denied or unknown. Scan result at
+this commit: 0 denied or unknown; to review: certifi (MPL-2.0, used unmodified as a dependency - fine)
+and the BCA method citation (no data shipped).
+
+Trademarks: product names (ClimateStudio, Ladybug Tools, Radiance, EnergyPlus, LEED, Green Mark) appear
+only nominatively in documentation and result notes, with a non-affiliation statement; no logos, no
+third-party names in product or command names, no certification wording (Singapore results say
+"indicative; not a BCA Green Mark assessment", daylight references say "not a LEED assessment").
+
+Open permission requests worth sending before launch (none is needed for the current scope):
+- BCA - permission to bundle the ETTV/RETV tables (CF, SC, material k-values) for a table-based figure.
+- Enterprise Singapore - SS 553 design conditions as defaults (currently user inputs).
+- DESNZ / BRE - SAP 10.2 tables, if a UK SAP-style module is wanted.
+- IWU - TABULA data directly (currently via CC BY Hotmaps).
+- ABCB / MBIE - none needed (CC BY 4.0); Australian NCC and NZ H1 packs are planned, not yet keyed.
+
+This audit is an engineering record, not legal advice: have counsel review it before commercial launch.
+
 ## Rebuild triggers
 
 Re-run this audit if any of these change:
@@ -68,6 +129,10 @@ Re-run this audit if any of these change:
   manifest at the same time);
 - `Grasshopperfiles` content is referenced by a distributed artifact;
 - the bridge gains a NuGet dependency (extend the Yak notices);
+- `almond_mcp` (or anything shipped) starts importing `openseespy`, or `benchmarks/` is added to
+  the sdist/wheel;
+- a generated asset is regenerated or re-prompted (update `provenance.json` and
+  rebuild the manifest so task ids and checksums stay truthful);
 - Almond starts shipping generated geometry derived from 3D Warehouse meshes
   (bounding boxes computed from a mesh are fine; simplified copies of the
   mesh are not).

@@ -12,6 +12,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+# Assets dropped from their manifest but still placed in a recorded scene.
+RETIRED_LIBRARY_ID = "retired"
+
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -380,10 +383,26 @@ class AlmondStore:
                     "DELETE FROM asset_rtree WHERE asset_rowid = ?",
                     (stale["id"],),
                 )
-                connection.execute(
-                    "DELETE FROM assets WHERE id = ?",
-                    (stale["id"],),
-                )
+                referenced = connection.execute(
+                    "SELECT 1 FROM instances WHERE asset_id = ? LIMIT 1",
+                    (stale["asset_id"],),
+                ).fetchone()
+                if referenced:
+                    # Scene history still points at this asset: keep the row
+                    # for lookups but take it out of its library and search.
+                    connection.execute(
+                        """
+                        UPDATE assets SET library_id = ?, file_available = 0,
+                            updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (RETIRED_LIBRARY_ID, now, stale["id"]),
+                    )
+                else:
+                    connection.execute(
+                        "DELETE FROM assets WHERE id = ?",
+                        (stale["id"],),
+                    )
         return len(seen)
 
     @staticmethod
@@ -430,6 +449,9 @@ class AlmondStore:
         if library_id.strip():
             clauses.append("a.library_id = ?")
             parameters.append(library_id.strip().lower())
+        else:
+            clauses.append("a.library_id != ?")
+            parameters.append(RETIRED_LIBRARY_ID)
         tokens = re.findall(r"[\w-]+", query.lower(), flags=re.UNICODE)
         if tokens:
             joins = "JOIN asset_fts ON asset_fts.asset_id = a.asset_id"
@@ -1034,6 +1056,20 @@ class AlmondStore:
             "orphaned_instances": orphaned,
             "revision": revision,
         }
+
+    def scene_instances(self, scene_id: str) -> list[dict[str, Any]]:
+        """Every instance of a scene with its world bounding box (mm), for structural loads."""
+        with self._connect() as conn:
+            if not conn.execute("SELECT 1 FROM scenes WHERE scene_id = ?", (scene_id,)).fetchone():
+                raise KeyError(f"Unknown scene_id: {scene_id}")
+            rows = conn.execute(
+                """
+                SELECT instance_id, asset_id, rhino_guid, scale, min_x, max_x, min_y, max_y, min_z, max_z
+                FROM instances WHERE scene_id = ? ORDER BY instance_id
+                """,
+                (scene_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     def validate_scene(self, scene_id: str, limit: int = 100) -> dict[str, Any]:
         if not self.get_scene(scene_id):

@@ -6,6 +6,11 @@ Subcommands:
                 original download URL and expected sha256 for each
   doctor        check directories, manifests, state DB, and the Rhino bridge
   paths         print every resolved directory and the state DB location
+  design-codes  list the design code profiles and any profile files that fail validation
+  solve         one native structural study: JSON request on stdin, JSON reply
+                on stdout (the Rhino panel's solver)
+  environment   the Rhino panel's environment engine: rooms, constructions and
+                studies, JSON request on stdin, JSON reply on stdout
 """
 from __future__ import annotations
 
@@ -17,17 +22,28 @@ import sys
 import webbrowser
 from pathlib import Path
 
-from almond_mcp import __version__, paths
+from almond_mcp import __version__, bridge_client, paths
 
 BRIDGE_HOST = "127.0.0.1"
 BRIDGE_PORT = 5000
 
 # Libraries whose manifests reference downloadable model files.
 _MODEL_LIBRARIES = (
-    ("RHINO_MCP_FURNITURE_DIR", "IKEA furniture"),
     ("RHINO_MCP_DRAWING_ASSET_DIR", "drawing assets"),
     ("RHINO_MCP_DIAGRAM_ASSET_DIR", "diagram assets"),
+    ("RHINO_MCP_GENERATED_ASSET_DIR", "generated assets"),
 )
+
+
+def cmd_audit_assets(args: argparse.Namespace) -> int:
+    """Verify the bundled generated pack, including embedded/sidecar agreement."""
+    from almond_mcp.asset_passport import audit_library
+    try:
+        result = audit_library(Path(paths.resolve_dir("RHINO_MCP_GENERATED_ASSET_DIR")))
+    except (OSError, ValueError, KeyError) as exc:
+        result = {"status": "error", "message": str(exc)}
+    print(json.dumps(result, indent=2))
+    return 0 if result["status"] == "success" else 1
 
 
 def _load_manifest(library_dir: Path) -> dict | None:
@@ -43,6 +59,21 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1 << 20), b""):
             digest.update(chunk)
     return digest.hexdigest().upper()
+
+
+def _download(url: str, target: Path) -> bool:
+    """Fetch one redistributable file (the generated library only). Returns
+    True on success; never raises, so fetch-assets keeps going."""
+    import urllib.request
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with urllib.request.urlopen(url, timeout=60) as response, target.open("wb") as out:
+            for chunk in iter(lambda: response.read(1 << 20), b""):
+                out.write(chunk)
+        return True
+    except Exception as exc:  # network, 404, permissions - report and continue
+        print(f"                download failed: {exc}")
+        return False
 
 
 def _asset_status(library_dir: Path, asset: dict) -> tuple[str, str]:
@@ -80,6 +111,18 @@ def cmd_fetch_assets(args: argparse.Namespace) -> int:
         print(f"\n[{label}] {library_dir}")
         for asset in manifest.get("assets", []):
             status, detail = _asset_status(library_dir, asset)
+            # Generated assets are ours (CC BY 4.0) and carry a download_url,
+            # so - unlike 3D Warehouse content - they can be fetched directly.
+            if (status in ("missing", "hash-mismatch") and asset.get("download_url")
+                    and not getattr(args, "no_download", False)):
+                if _download(asset["download_url"], library_dir / asset["file"]):
+                    contract = asset.get("contract_file")
+                    if contract and asset.get("contract_download_url"):
+                        _download(asset["contract_download_url"], library_dir / contract)
+                    status, detail = _asset_status(library_dir, asset)
+                    if status == "ok":
+                        print(f"  downloaded    {asset['asset_id']}")
+                        continue
             if status == "ok":
                 if args.verbose:
                     print(f"  ok            {asset['asset_id']}")
@@ -155,13 +198,33 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     print("Rhino bridge:")
     try:
         with socket.create_connection((BRIDGE_HOST, BRIDGE_PORT), timeout=2):
-            check(f"bridge listening on {BRIDGE_HOST}:{BRIDGE_PORT}", True)
+            listening = True
+        check(f"bridge listening on {BRIDGE_HOST}:{BRIDGE_PORT}", True)
     except OSError:
+        listening = False
         check(
             f"bridge listening on {BRIDGE_HOST}:{BRIDGE_PORT}",
             False,
             "start Rhino 8 with the RhinoAlmondBridge plugin loaded",
         )
+    if listening:
+        reply = bridge_client.ping()
+        if reply.get("status") == "ok" and reply.get("bridge") == "almondbridge":
+            check("bridge accepts this client's session token", True,
+                  f"almondbridge {reply.get('version')} (protocol {reply.get('protocol')})")
+            expected = reply.get("python_package")
+            if expected and expected != f"almond-mcp@{__version__}":
+                print(f"  note  almondbridge {reply.get('version')} pairs with {expected}; this is almond-mcp {__version__}")
+        elif reply.get("code") == "unauthorized":
+            found = bridge_client.token()
+            check("bridge accepts this client's session token", False,
+                  ("the token in " if found else "no token at ") + str(bridge_client.token_path()) +
+                  (" is not this Rhino session's: restart Rhino, or unset ALMOND_BRIDGE_TOKEN" if found else
+                   ": restart Rhino with almondbridge loaded (it writes the token at startup)"))
+        elif reply.get("code") == "unreachable":
+            check("bridge answers a ping", False, reply.get("message", ""))
+        else:
+            print("  note  this almondbridge predates session tokens (protocol 2): update it in Rhino's Package Manager")
 
     print("\nAll checks passed." if ok else "\nSome checks failed (see above).")
     return 0 if ok else 1
@@ -185,6 +248,41 @@ def cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_design_codes(args: argparse.Namespace) -> int:
+    from almond_mcp.design_codes import listing
+    data = listing()
+    if args.json:
+        print(json.dumps(data, indent=2))
+        return 1 if data["problems"] else 0
+    print(f"Design code profiles (default: {data['default']}; user folder: {data['user_dir']})\n")
+    for p in data["profiles"]:
+        state = "verified" if p["verified"] else "UNVERIFIED: " + ", ".join(p["unverified"])
+        print(f"  {p['id']:<16} {p['name']}  [{p['origin']}; {state}]")
+    for problem in data["problems"]:
+        print(f"  ! {problem}")
+    return 1 if data["problems"] else 0
+
+
+def cmd_solve(args: argparse.Namespace) -> int:
+    import io
+    from almond_mcp.structure_study import main as solve
+    # utf-8-sig: .NET writes a byte-order mark to a child's stdin when the console encoding is UTF-8
+    return solve(io.TextIOWrapper(sys.stdin.buffer, encoding="utf-8-sig"),
+                 io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8"))
+
+
+def cmd_environment(args: argparse.Namespace) -> int:
+    import io
+    from almond_mcp.environment.panel import main as environment
+    return environment(io.TextIOWrapper(sys.stdin.buffer, encoding="utf-8-sig"),
+                       io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8"))
+
+
+def cmd_library(args: argparse.Namespace) -> int:
+    from almond_mcp.asset_repository import serve_library
+    return serve_library(args.port, args.open)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="almond-mcp",
@@ -198,6 +296,8 @@ def main(argv: list[str] | None = None) -> int:
     fetch = sub.add_parser(
         "fetch-assets", help="report missing/invalid model files and their sources"
     )
+    fetch.add_argument("--no-download", action="store_true",
+                     help="do not auto-download the generated (CC BY 4.0) models")
     fetch.add_argument(
         "--open", action="store_true", help="open missing assets' source pages"
     )
@@ -206,6 +306,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     sub.add_parser("doctor", help="check directories, manifests, DB, and bridge")
     sub.add_parser("paths", help="print resolved directories")
+    sub.add_parser("audit-assets", help="verify generated GLBs, embedded passports, contracts and previews offline")
+
+    sub.add_parser("solve", help="native structural study: JSON on stdin, JSON on stdout")
+    sub.add_parser("environment", help="environment workspace engine (rooms, constructions, studies): JSON on stdin, JSON on stdout")
+    codes = sub.add_parser("design-codes", help="list and validate design code profiles")
+    codes.add_argument("--json", action="store_true", help="machine-readable listing")
+
+    library = sub.add_parser("library", help="open the unified model and drawing archive")
+    library.add_argument("--port", type=int, default=8767, help="loopback HTTP port (default: 8767)")
+    library.add_argument("--open", action="store_true", help="open the archive in your browser")
 
     args = parser.parse_args(argv)
     handlers = {
@@ -214,6 +324,11 @@ def main(argv: list[str] | None = None) -> int:
         "fetch-assets": cmd_fetch_assets,
         "doctor": cmd_doctor,
         "paths": cmd_paths,
+        "library": cmd_library,
+        "audit-assets": cmd_audit_assets,
+        "solve": cmd_solve,
+        "environment": cmd_environment,
+        "design-codes": cmd_design_codes,
     }
     return handlers[args.command](args)
 

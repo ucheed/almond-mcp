@@ -35,6 +35,24 @@ namespace RhinoAlmondBridge
 
         /// <summary>Total imposed load in kN, split across free nodes, acting in -Z.</summary>
         public double ImposedLoadKN { get; set; } = 10.0;
+        public bool IncludeSelfWeight { get; set; } = true;
+        public bool FixedRotations { get; set; } = true;
+
+        /// <summary>Also extract nodal and sampled member displacements (for the structure view).</summary>
+        public bool ReturnGeometry { get; set; }
+    }
+
+    /// <summary>One analysed straight member with displacements sampled along it (meters).</summary>
+    public class ElementDeflection
+    {
+        public List<string> SourceGuids { get; set; } = new List<string>();
+        public double[] StartM { get; set; }
+        public double[] EndM { get; set; }
+        /// <summary>Translations at equally spaced stations from start to end, meters.</summary>
+        public List<double[]> SampleDispM { get; set; } = new List<double[]>();
+        public double Utilization { get; set; } = double.NaN;
+        /// <summary>Pinned (moment-released) ends: [start, end]; null when rigid.</summary>
+        public bool[] Hinges { get; set; }
     }
 
     /// <summary>Per-element utilization with Rhino GUID lineage.</summary>
@@ -54,6 +72,10 @@ namespace RhinoAlmondBridge
         public string FailureReason { get; set; }
 
         public double MaxDisplacementMM { get; set; }
+        public bool DisplacementAvailable { get; set; }
+        public bool UtilizationAvailable { get; set; }
+        public List<double[]> SupportPointsM { get; set; } = new List<double[]>();
+        public List<double[]> LoadedPointsM { get; set; } = new List<double[]>();
 
         /// <summary>Utilization per analyzed element, keyed to source Rhino GUIDs.</summary>
         public List<ElementUtilization> PerElementUtilization { get; set; } = new List<ElementUtilization>();
@@ -65,6 +87,13 @@ namespace RhinoAlmondBridge
         public double ReactionsKN { get; set; }
 
         public List<string> Warnings { get; set; } = new List<string>();
+
+        /// <summary>Per node: x, y, z, dx, dy, dz in meters (first load case).</summary>
+        public List<double[]> NodeDispM { get; set; } = new List<double[]>();
+
+        /// <summary>Per beam element: sampled displaced shape + utilization.</summary>
+        public List<ElementDeflection> Elements { get; set; } = new List<ElementDeflection>();
+        public bool GeometryAvailable { get; set; }
     }
 
     public static class KarambaAdapter
@@ -434,6 +463,13 @@ namespace RhinoAlmondBridge
                 { "lines", new[] { "curves" } },
                 { "identifiers", new[] { "ids" } },
                 { "ids", new[] { "identifiers" } },
+                // 3.1.60921: IsotropicMaterial(.., E, Gip, Gtr, ..) — unmatched,
+                // the shear moduli were filled with 0 and the solve went singular.
+                { "gip", new[] { "g12" } },
+                { "gtr", new[] { "g3" } },
+                // GravityLoad(Vector3 force, ..) and CircularHollow(diameter, ..).
+                { "force", new[] { "direction" } },
+                { "diameter", new[] { "height" } },
             };
 
         private static bool TryMatchArg(string paramName, Dictionary<string, object> namedArgs,
@@ -706,7 +742,11 @@ namespace RhinoAlmondBridge
             //   string family, string name, double E, double G12, double G3,
             //   double gamma, double ft, double fc,
             //   FemMaterial.FlowHypothesis flowHypothesis, double alphaT)
-            // Units: E/G/ft/fc in kN/cm^2, gamma in kN/m^3.
+            // Units: the factory takes E/G/ft/fc in kN/m^2 (the GH UI shows
+            // kN/cm^2; the table above is kN/cm^2, hence x1e4), gamma in kN/m^3.
+            // Verified live (3.1.60921): a 3 m CHS 114.3x4 cantilever deflects
+            // ~0.1 m with kN/m^2 and ~1 km with kN/cm^2.
+            const double KNcm2ToKNm2 = 1e4;
             var materialFactory = GetFactory(k3d, "Material");
             object material = InvokeNamed(materialFactory, materialFactory.GetType(),
                 "IsotropicMaterial",
@@ -714,12 +754,12 @@ namespace RhinoAlmondBridge
                 {
                     { "family", matDef.Family },
                     { "name", matDef.Name },
-                    { "E", matDef.E },
-                    { "G12", matDef.G12 },
-                    { "G3", matDef.G3 },
+                    { "E", matDef.E * KNcm2ToKNm2 },
+                    { "G12", matDef.G12 * KNcm2ToKNm2 },
+                    { "G3", matDef.G3 * KNcm2ToKNm2 },
                     { "gamma", matDef.Gamma },
-                    { "ft", matDef.Ft },
-                    { "fc", matDef.Fc },
+                    { "ft", matDef.Ft * KNcm2ToKNm2 },
+                    { "fc", matDef.Fc * KNcm2ToKNm2 },
                     { "alphaT", matDef.AlphaT },
                 },
                 null);
@@ -738,6 +778,7 @@ namespace RhinoAlmondBridge
 
             // ── Beams: LineToBeam ────────────────────────────────────────────
             var lineObjs = new List<object>();
+            var segEnds = new List<Point3d[]>();   // meters, parallel to lineObjs
             var beamIds = new List<object>();
             var beamCroSecs = new List<object>();
 
@@ -776,6 +817,7 @@ namespace RhinoAlmondBridge
                     if (a.DistanceTo(b) <= tolM) continue;
 
                     lineObjs.Add(NewLine3(NewPoint3(a.X, a.Y, a.Z), NewPoint3(b.X, b.Y, b.Z)));
+                    segEnds.Add(new[] { a, b });
                     beamIds.Add(beam.SourceGuids.FirstOrDefault() ?? "beam");
                     beamCroSecs.Add(croSec);
                     elementGuids.Add(new List<string>(beam.SourceGuids));
@@ -894,7 +936,8 @@ namespace RhinoAlmondBridge
             var supportFactory = GetFactory(k3d, "Support");
             var supportType = FindType("Karamba.Supports.Support");
             var supportObjs = new List<object>();
-            var fullyFixed = new List<bool> { true, true, true, true, true, true };
+            var fullyFixed = new List<bool> { true, true, true, spec.FixedRotations, spec.FixedRotations, spec.FixedRotations };
+            res.SupportPointsM = supportPtsM.Select(p => new[] {p.X,p.Y,p.Z}).ToList();
 
             foreach (var p in supportPtsM)
             {
@@ -920,6 +963,8 @@ namespace RhinoAlmondBridge
             // karambaCommon 3.1: Karamba.Loads.GravityLoad(Vector3 direction)
             // (also reachable via Karamba.Factories.FactoryLoad.GravityLoad).
             // Direction (0,0,-1) = self weight acting downward.
+            if (spec.IncludeSelfWeight)
+            {
             object gravity;
             try
             {
@@ -933,6 +978,7 @@ namespace RhinoAlmondBridge
                 gravity = Activator.CreateInstance(gravityType, NewVector3(0, 0, -1));
             }
             loadObjs.Add(gravity);
+            }
 
             // Imposed load: total ImposedLoadKN split evenly over free
             // (non-support) nodes; if every node is a support, use all nodes.
@@ -943,6 +989,7 @@ namespace RhinoAlmondBridge
 
             if (spec.ImposedLoadKN > 0 && freeNodes.Count > 0)
             {
+                res.LoadedPointsM = freeNodes.Select(p => new[] {p.X,p.Y,p.Z}).ToList();
                 double perNodeKN = spec.ImposedLoadKN / freeNodes.Count;
                 foreach (var p in freeNodes)
                 {
@@ -1015,25 +1062,9 @@ namespace RhinoAlmondBridge
                 if (doubles.Count > 0)
                 {
                     maxDispM = doubles.Max(Math.Abs);
-                    dispFound = true;
+                    dispFound = doubles.All(d => !double.IsNaN(d) && !double.IsInfinity(d));
                 }
                 break;
-            }
-            if (!dispFound)
-            {
-                // Fall back to any out param that flattens to doubles.
-                foreach (var kv in analyzeOuts)
-                {
-                    var doubles = FlattenDoubles(kv.Value).ToList();
-                    if (doubles.Count > 0)
-                    {
-                        maxDispM = doubles.Max(Math.Abs);
-                        dispFound = true;
-                        res.Warnings.Add("Displacement read from out param '" + kv.Key +
-                            "' by shape, not name.");
-                        break;
-                    }
-                }
             }
             foreach (var kv in analyzeOuts)
             {
@@ -1042,12 +1073,14 @@ namespace RhinoAlmondBridge
             }
             if (!dispFound)
                 res.Warnings.Add("AnalyzeThI returned no displacement out param; " +
-                    "MaxDisplacementMM reported as 0.");
+                    "displacement is unavailable.");
 
             res.MaxDisplacementMM = maxDispM * Units.MetersToMillimeters;
+            res.DisplacementAvailable = dispFound && !double.IsNaN(res.MaxDisplacementMM) && !double.IsInfinity(res.MaxDisplacementMM);
 
             // ── Per-element utilization ──────────────────────────────────────
-            var utils = TryComputeUtilization(analyzed, res.Warnings);
+            var utils = TryUtilizationBeam(analyzed, lineObjs.Count, res.Warnings)
+                        ?? TryComputeUtilization(analyzed, res.Warnings);
             if (utils != null && utils.Count > 0)
             {
                 int n = Math.Min(utils.Count, elementGuids.Count);
@@ -1062,6 +1095,7 @@ namespace RhinoAlmondBridge
                         Utilization = Math.Abs(utils[i]),
                     });
                 }
+                res.UtilizationAvailable = utils.Count == elementGuids.Count && utils.All(u => !double.IsNaN(u) && !double.IsInfinity(u));
             }
             else
             {
@@ -1069,13 +1103,41 @@ namespace RhinoAlmondBridge
                     "in this build; utilization-based checks fall back to 0.");
             }
 
+            // ── Displacement field (nodes + sampled members) ─────────────────
+            // karambaCommon 3.1 can report 0 through AnalyzeThI's max-displacement
+            // out param; the nodal field is authoritative whenever it is present.
+            try
+            {
+                ExtractDisplacements(analyzed, segEnds, elementGuids, spec.ReturnGeometry, res);
+                if (res.NodeDispM.Count > 0)
+                {
+                    double nodeMaxM = res.NodeDispM.Max(n => Math.Sqrt(n[3] * n[3] + n[4] * n[4] + n[5] * n[5]));
+                    double sampleMaxM = res.Elements.Count > 0
+                        ? res.Elements.SelectMany(e => e.SampleDispM).DefaultIfEmpty(new double[3])
+                              .Max(d => Math.Sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2])) : 0;
+                    double fieldMaxMM = Math.Max(nodeMaxM, sampleMaxM) * Units.MetersToMillimeters;
+                    if (!res.DisplacementAvailable || fieldMaxMM > res.MaxDisplacementMM)
+                    {
+                        res.MaxDisplacementMM = fieldMaxMM;
+                        res.DisplacementAvailable = !double.IsNaN(fieldMaxMM) && !double.IsInfinity(fieldMaxMM);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                res.Warnings.Add("Displacement field unavailable: " + ex.Message);
+            }
+            if (res.UtilizationAvailable && res.Elements.Count > 0)
+                for (int i = 0; i < res.Elements.Count && i < res.PerElementUtilization.Count; i++)
+                    res.Elements[i].Utilization = res.PerElementUtilization[i].Utilization;
+
             // Derived stress: max utilization x yield (documented in Units block).
             double maxUtil = res.PerElementUtilization.Count > 0
                 ? res.PerElementUtilization.Max(u => u.Utilization) : 0;
             res.MaxStressMPa = maxUtil * matDef.YieldMPa;
 
             // Reactions from vertical equilibrium (documented in Units block).
-            res.ReactionsKN = massKg * Units.GravityMS2 / 1000.0 + spec.ImposedLoadKN;
+            res.ReactionsKN = (spec.IncludeSelfWeight ? massKg * Units.GravityMS2 / 1000.0 : 0) + spec.ImposedLoadKN;
         }
 
         private static object BuildBeamCroSec(object croSecFactory, SectionSpec section,
@@ -1083,11 +1145,12 @@ namespace RhinoAlmondBridge
         {
             section = section ?? SectionSpec.DefaultBeam(unitScaleToMeters);
 
-            if (section.Shape == "box")
+            if (section.Shape == "box" || section.Shape == "rect")
             {
                 double hCm = Units.SectionCm(section.Height, unitScaleToMeters);
                 double wCm = Units.SectionCm(section.Width, unitScaleToMeters);
-                double tCm = Units.SectionCm(section.WallThickness, unitScaleToMeters);
+                // a solid rectangle (concrete, timber) as a box whose walls meet in the middle
+                double tCm = section.Shape == "rect" ? 0.49 * Math.Min(hCm, wCm) : Units.SectionCm(section.WallThickness, unitScaleToMeters);
                 if (hCm > 0 && wCm > 0)
                 {
                     try
@@ -1134,6 +1197,240 @@ namespace RhinoAlmondBridge
                     { "thickness", Math.Max(wallCm, 0.1) },
                 },
                 null);
+        }
+
+        private static double[] Xyz(object v)
+        {
+            if (v == null) return new double[3];
+            var t = v.GetType();
+            double Get(string n)
+            {
+                var pr = t.GetProperty(n); if (pr != null) return Convert.ToDouble(pr.GetValue(v));
+                var f = t.GetField(n); if (f != null) return Convert.ToDouble(f.GetValue(v));
+                return 0;
+            }
+            return new[] { Get("X"), Get("Y"), Get("Z") };
+        }
+
+        private static List<object> AsList(object o)
+        {
+            var list = new List<object>();
+            if (o is IEnumerable seq && !(o is string)) foreach (var x in seq) list.Add(x);
+            return list;
+        }
+
+        /// <summary>First-load-case vector from an entry that is either a vector or a per-load-case list.</summary>
+        private static double[] FirstVector(object entry)
+        {
+            if (entry is IEnumerable && !(entry is string))
+            {
+                var l = AsList(entry);
+                return l.Count > 0 ? FirstVector(l[0]) : new double[3];
+            }
+            return Xyz(entry);
+        }
+
+        /// <summary>
+        /// Nodal translations (and, when requested, displacements sampled along
+        /// every beam) from the analysed model, first load case.
+        /// </summary>
+        private static void ExtractDisplacements(object model, List<Point3d[]> segEnds,
+            List<List<string>> elementGuids, bool withMembers, KarambaResults res)
+        {
+            // karambaCommon 3.1: Karamba.Results.NodeDisplacements.solve(Model model,
+            //   string resultSelection, List<int> nodeIndexes, out List<List<Vector3>> trans,
+            //   out List<List<Vector3>> rotat, out .. governingLoadCases, out .. Inds,
+            //   out List<Point3> positions)  — empty nodeIndexes = all nodes, meters.
+            var ndType = FindType("Karamba.Results.NodeDisplacements");
+            string selection = null;
+            foreach (var sel in new[] { "0", "LC0", "" })
+            {
+                var nOuts = new Dictionary<string, object>();
+                InvokeNamed(null, ndType, "solve", new Dictionary<string, object>
+                {
+                    { "model", model }, { "resultSelection", sel }, { "nodeIndexes", new List<int>() },
+                }, nOuts);
+                var positions = AsList(nOuts.TryGetValue("positions", out var po) ? po : null);
+                var trans = AsList(nOuts.TryGetValue("trans", out var tr) ? tr : null);
+                var rotat = AsList(nOuts.TryGetValue("rotat", out var ro) ? ro : null);
+                // Orientation of the nested list differs between builds: [node][lc] or [lc][node].
+                List<object> PerNode(List<object> field) => field.Count == positions.Count ? field
+                    : (field.Count > 0 ? AsList(field[0]) : new List<object>());
+                var perNode = PerNode(trans); var perNodeRot = PerNode(rotat);
+                var rows = new List<double[]>();
+                for (int i = 0; i < positions.Count && i < perNode.Count; i++)
+                {
+                    var p = Xyz(positions[i]); var d = FirstVector(perNode[i]);
+                    var r = i < perNodeRot.Count ? FirstVector(perNodeRot[i]) : new double[3];
+                    rows.Add(new[] { p[0], p[1], p[2], d[0], d[1], d[2], r[0], r[1], r[2] });
+                }
+                if (rows.Count == 0 || rows.Any(r => r.Skip(3).Any(v => double.IsNaN(v) || double.IsInfinity(v))))
+                    continue;
+                res.NodeDispM = rows;
+                selection = sel;
+                break;
+            }
+            if (selection == null)
+            {
+                res.Warnings.Add("Nodal displacements are not finite (singular model: check supports and sections).");
+                return;
+            }
+            if (!withMembers || segEnds.Count == 0) return;
+
+            // karambaCommon 3.1: Karamba.Results.BeamDisplacements.solve(Model model,
+            //   List<string> elementsIDs, string resultSelection, double maxResultsDistance,
+            //   int minResultsIntervals, out List<List<List<Vector3>>> translations, ...,
+            //   out List<int> elementInds)  — equally spaced stations along each beam.
+            try
+            {
+            var bdType = FindType("Karamba.Results.BeamDisplacements");
+            var bOuts = new Dictionary<string, object>();
+            InvokeNamed(null, bdType, "solve", new Dictionary<string, object>
+            {
+                { "model", model }, { "elementsIDs", new List<string>() }, { "resultSelection", selection },
+                { "maxResultsDistance", 0.2 }, { "minResultsIntervals", 10 },
+            }, bOuts);
+            var bt = AsList(bOuts.TryGetValue("translations", out var bto) ? bto : null);
+            var inds = AsList(bOuts.TryGetValue("elementInds", out var eio) ? eio : null)
+                .Select(x => x == null ? -1 : Convert.ToInt32(x)).ToList();
+            // [elem][station][lc] expected; tolerate [lc][elem][station].
+            if (bt.Count == 1 && segEnds.Count > 1) bt = AsList(bt[0]);
+            for (int r = 0; r < bt.Count; r++)
+            {
+                int e = r < inds.Count && inds[r] >= 0 ? inds[r] : r;
+                if (e < 0 || e >= segEnds.Count) continue;
+                var el = new ElementDeflection
+                {
+                    SourceGuids = e < elementGuids.Count ? new List<string>(elementGuids[e]) : new List<string>(),
+                    StartM = new[] { segEnds[e][0].X, segEnds[e][0].Y, segEnds[e][0].Z },
+                    EndM = new[] { segEnds[e][1].X, segEnds[e][1].Y, segEnds[e][1].Z },
+                };
+                foreach (var st in AsList(bt[r])) el.SampleDispM.Add(FirstVector(st));
+                res.Elements.Add(el);
+            }
+            res.Elements = res.Elements.OrderBy(x => segEnds.FindIndex(sg =>
+                sg[0].X == x.StartM[0] && sg[0].Y == x.StartM[1] && sg[0].Z == x.StartM[2] &&
+                sg[1].X == x.EndM[0] && sg[1].Y == x.EndM[1] && sg[1].Z == x.EndM[2])).ToList();
+            }
+            catch (Exception ex)
+            {
+                res.Warnings.Add("BeamDisplacements.solve failed: " + ex.Message);
+            }
+            res.GeometryAvailable = res.Elements.Count == segEnds.Count && res.Elements.All(x => x.SampleDispM.Count >= 2);
+            if (!res.GeometryAvailable)
+            {
+                res.Warnings.Add($"Member stations unavailable from BeamDisplacements ({res.Elements.Count}/{segEnds.Count} " +
+                    "members); shapes interpolated from nodal translations and rotations (cubic Hermite).");
+                res.Elements = HermiteMembers(segEnds, elementGuids, res.NodeDispM, 12);
+                res.GeometryAvailable = res.Elements.Count == segEnds.Count;
+            }
+        }
+
+        /// <summary>
+        /// Deflected member shapes from end-node results: transverse displacement
+        /// is the cubic Hermite of the end translations with end slopes theta x axis;
+        /// exact for prismatic beams without member loads.
+        /// </summary>
+        private static List<ElementDeflection> HermiteMembers(List<Point3d[]> segEnds,
+            List<List<string>> elementGuids, List<double[]> nodes, int intervals)
+        {
+            double[] Nearest(Point3d p) => nodes.OrderBy(n =>
+                (n[0] - p.X) * (n[0] - p.X) + (n[1] - p.Y) * (n[1] - p.Y) + (n[2] - p.Z) * (n[2] - p.Z)).First();
+            var list = new List<ElementDeflection>();
+            for (int e = 0; e < segEnds.Count; e++)
+            {
+                Point3d a = segEnds[e][0], b = segEnds[e][1];
+                var na = Nearest(a); var nb = Nearest(b);
+                var axis = b - a; double len = axis.Length; axis.Unitize();
+                var ua = new Vector3d(na[3], na[4], na[5]); var ub = new Vector3d(nb[3], nb[4], nb[5]);
+                var sa = na.Length >= 9 ? Vector3d.CrossProduct(new Vector3d(na[6], na[7], na[8]), axis) * len : Vector3d.Zero;
+                var sb = nb.Length >= 9 ? Vector3d.CrossProduct(new Vector3d(nb[6], nb[7], nb[8]), axis) * len : Vector3d.Zero;
+                var el = new ElementDeflection
+                {
+                    SourceGuids = e < elementGuids.Count ? new List<string>(elementGuids[e]) : new List<string>(),
+                    StartM = new[] { a.X, a.Y, a.Z }, EndM = new[] { b.X, b.Y, b.Z },
+                };
+                for (int i = 0; i <= intervals; i++)
+                {
+                    double t = (double)i / intervals, t2 = t * t, t3 = t2 * t;
+                    var d = (2 * t3 - 3 * t2 + 1) * ua + (t3 - 2 * t2 + t) * sa
+                          + (-2 * t3 + 3 * t2) * ub + (t3 - t2) * sb;
+                    el.SampleDispM.Add(new[] { d.X, d.Y, d.Z });
+                }
+                list.Add(el);
+            }
+            return list;
+        }
+
+        /// <summary>
+        /// karambaCommon 3.1 names the beam utilization solver
+        /// Karamba.Results.Utilization_Beam.solve(Model model, List&lt;string&gt; retElemIds,
+        ///   string resultSelection, int resNum, bool elastDesign, double gammaM0,
+        ///   double gammaM1, bool withDetails, out List&lt;List&lt;UtilizationResults_Item&gt;&gt; modelUtil,
+        ///   out List&lt;List&lt;int&gt;&gt; modelUtilLCInd, out string msg, out IEnumerable&lt;int&gt; elementInds).
+        /// Returns max utilization per beam, or null when unavailable.
+        /// </summary>
+        private static List<double> TryUtilizationBeam(object model, int nBeams, List<string> warnings)
+        {
+            if (nBeams == 0) return null;
+            Type ut;
+            try { ut = FindType("Karamba.Results.Utilization_Beam"); }
+            catch { return null; }
+            foreach (var ids in new[] { new List<string>(), new List<string> { "" } })
+            {
+                try
+                {
+                    var outs = new Dictionary<string, object>();
+                    InvokeNamed(null, ut, "solve", new Dictionary<string, object>
+                    {
+                        { "model", model }, { "retElemIds", ids }, { "resultSelection", "0" },
+                        { "resNum", 5 }, { "elastDesign", true }, { "gammaM0", 1.0 }, { "gammaM1", 1.1 },
+                        { "withDetails", false },
+                    }, outs);
+                    var rows = AsList(outs.TryGetValue("modelUtil", out var mu) ? mu : null);
+                    if (rows.Count == 0) continue;
+                    var vals = new List<double>();
+                    foreach (var row in rows)
+                    {
+                        double best = double.NaN;
+                        foreach (var item in AsList(row))
+                        {
+                            double v = ItemUtilization(item);
+                            if (!double.IsNaN(v) && (double.IsNaN(best) || v > best)) best = v;
+                        }
+                        vals.Add(best);
+                    }
+                    if (vals.All(double.IsNaN)) continue;
+                    return vals.Select(v => double.IsNaN(v) ? 0 : v).ToList();
+                }
+                catch (Exception ex)
+                {
+                    warnings.Add("Utilization_Beam.solve failed: " + ex.Message);
+                }
+            }
+            return null;
+        }
+
+        /// <summary>Governing utilization of one UtilizationResults_Item (probe numeric "util" members).</summary>
+        private static double ItemUtilization(object item)
+        {
+            if (item == null) return double.NaN;
+            if (item is double dd) return dd;
+            double best = double.NaN;
+            foreach (var m in item.GetType().GetMembers(BindingFlags.Public | BindingFlags.Instance))
+            {
+                if (!NormalizeName(m.Name).Contains("util")) continue;
+                object v = null;
+                try
+                {
+                    if (m is PropertyInfo pi && pi.GetIndexParameters().Length == 0) v = pi.GetValue(item);
+                    else if (m is FieldInfo fi) v = fi.GetValue(item);
+                }
+                catch { }
+                foreach (var d in FlattenDoubles(v))
+                    if (!double.IsNaN(d) && !double.IsInfinity(d) && (double.IsNaN(best) || Math.Abs(d) > best)) best = Math.Abs(d);
+            }
+            return best;
         }
 
         /// <summary>
